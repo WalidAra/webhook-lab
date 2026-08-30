@@ -1,12 +1,28 @@
-const fetchReceiver = async (event: any) => {
-  return await fetch("http://localhost:3000/webhook/payment", {
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET ?? "dev-shared-secret";
+const RECEIVER_URL =
+  process.env.RECEIVER_URL ?? "http://localhost:3000/webhook/payment";
+
+function signPayload(payload: string, timestamp: number, secret: string) {
+  const hasher = new Bun.CryptoHasher("sha256", secret);
+  hasher.update(`${timestamp}.${payload}`);
+  return hasher.digest("hex");
+}
+
+async function deliver(event: unknown) {
+  const payload = JSON.stringify(event);
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signature = signPayload(payload, timestamp, WEBHOOK_SECRET);
+
+  return fetch(RECEIVER_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "X-Webhook-Timestamp": String(timestamp),
+      "X-Webhook-Signature": `sha256=${signature}`,
     },
-    body: JSON.stringify(event),
+    body: payload,
   });
-};
+}
 
 Bun.serve({
   port: 4000,
@@ -14,11 +30,25 @@ Bun.serve({
     const url = new URL(req.url);
 
     if (req.method === "POST" && url.pathname === "/publish/payment") {
-      const event = { event: "payment.succeeded", orderId: "abc" };
+      const body = (await req.json().catch(() => ({}))) as {
+        amount?: number;
+        currency?: string;
+      };
+      const event = {
+        id: crypto.randomUUID(),
+        type: "payment.completed",
+        createdAt: new Date().toISOString(),
+        data: {
+          amount: body.amount ?? 4200,
+          currency: body.currency ?? "usd",
+        },
+      };
 
+      let receiverStatus: number | null = null;
       for (let i = 0; i < 4; i++) {
         try {
-          const response = await fetchReceiver(event);
+          const response = await deliver(event);
+          receiverStatus = response.status;
           if (!response.ok)
             throw new Error(`receiver returned ${response.status}`);
           console.log("delivered:", response.status);
@@ -29,8 +59,8 @@ Bun.serve({
 
         if (i < 3) await Bun.sleep(1000 * 2 ** i);
       }
-      // 4. answer the person who hit /publish/payment
-      return new Response("published");
+
+      return Response.json({ published: event.id, receiverStatus });
     }
 
     return new Response("Not Found", { status: 404 });
